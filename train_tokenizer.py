@@ -12,11 +12,17 @@ def train_tokenizer():
                 yield data['text']
 
     data_path = './dataset/tokenizer_train.jsonl'
+    # 实例化一个BPE 分词模型
     tokenizer = Tokenizer(models.BPE())
+    # 创建一个字节级别的预分词器，作用是在正式使用分词模型（如 BPE、WordPiece 等）进行分词之前，对输入文本进行一些初步的处理。
+    # ByteLevel 表示该预分词器基于字节级别进行操作，而 add_prefix_space=False 是一个参数设置，用于控制是否在文本前添加一个空格。
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
 
     special_tokens = ["<unk>", "<s>", "</s>"]
 
+    # BPE 是一种子词分词算法，trainers.BpeTrainer 就是专门用来在给定的语料库上训练 BPE 分词模型的工具。
+    # 通过不断合并最频繁出现的字符对，逐步构建出一个合适的词表，从而实现将文本分割成有意义的子词单元的目的。
+    # 训练好的 BPE 分词器可以应用于自然语言处理的多个任务，如机器翻译、文本生成、问答系统等。
     trainer = trainers.BpeTrainer(
         vocab_size = 6400,
         special_tokens = special_tokens,
@@ -26,6 +32,8 @@ def train_tokenizer():
 
     texts = read_texts_from_jsonl(data_path)
     tokenizer.train_from_iterator(texts, trainer)
+    # 字节级别的解码器主要负责将经过字节级别编码（例如通过字节对编码BPE算法进行分词后得到的字节级别的token序列）后的 token 序列重新转换回原始的文本字符串。
+    # 在自然语言处理流程中，分词器将文本拆分成 token，而解码器则是这个过程的逆操作，将token还原成原始文本，以便于人类阅读或者进行后续的文本处理。
     tokenizer.decoder = decoders.ByteLevel()
     assert tokenizer.token_to_id("<unk>") == 0
     assert tokenizer.token_to_id("<s>") == 1
