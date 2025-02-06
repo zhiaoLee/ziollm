@@ -3,8 +3,11 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-from typing import Optional
-from transformers import PreTrainedModel
+from typing import Optional, Callable, List, Union
+
+from torch.nn.modules.module import T
+from transformers import PreTrainedModel, GenerationConfig, LogitsProcessorList, StoppingCriteriaList
+from transformers.generation.utils import GenerateOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .LMConfig import LMConfig
@@ -28,14 +31,14 @@ def precompute_pos_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
-    poc_cis = torch.polar(torch.ones_like(freqs), freqs)
+    poc_cis = torch.polar(torch.ones_like(freqs), freqs) #complex64
     return poc_cis
 
 
 def apply_rotary_emb(xq, xk, poc_cis):
     def unite_shape(poc_cis, x):
         ndim = x.ndim
-        assert 0 <= 1 <= ndim
+        assert 0 <= 1 < ndim
         assert poc_cis.shape == (x.shape[1], x.shape[-1])
         shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
         return poc_cis.view(*shape)
@@ -46,8 +49,8 @@ def apply_rotary_emb(xq, xk, poc_cis):
     # flatten 函数用于将输入的张量展平，即将一个多维张量转换为一维张量。flatten(3)表示从第 3 维度开始将后面的维度展平。
     # torch.view_as_complex(...)：将乘法结果转换为复数张量。前提是 xq_ * poc_cis 的结果张量的最后一个维度大小为 2，
     # 因为 torch.view_as_complex 要求输入张量的最后一个维度存储实部和虚部。
-    xq_out = torch.view_as_complex(xq_ * poc_cis).flatten(3)
-    xk_out = torch.view_as_complex(xk_ * poc_cis).flatten(3)
+    xq_out = torch.view_as_real(xq_ * poc_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * poc_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -78,7 +81,6 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
-
 class Attention(nn.Module):
     def __init__(self, args: LMConfig):
         super().__init__()
@@ -103,6 +105,9 @@ class Attention(nn.Module):
         mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
         mask = torch.triu(mask, diagonal=1)
 
+        # 在 PyTorch 里，当创建一个自定义的神经网络模块（继承自 torch.nn.Module）时，有时候需要存储一些不需要进行反向传播更新的张量，
+        # 例如掩码（mask）、统计信息等。register_buffer 方法就可以将这些张量注册为模块的缓冲区，这样它们就会成为模块状态的一部分，
+        # 可以随着模块一起保存和加载，但是不会被当作模型的参数（即不会在优化器更新参数时被更新）。
         self.register_buffer("mask", mask, persistent=False) # ？？？
 
     def forward(self, x: torch.Tensor, pos_cis: torch.Tensor, kv_cache=False):
@@ -148,6 +153,7 @@ class TransformerBlock(nn.Module):
 
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
 
         self.feed_forward = FeedForward(
@@ -240,9 +246,11 @@ class Transformer(PreTrainedModel):
 
         return self.OUT
 
+
+    ## @torch.inference_mode() 是 PyTorch 中的一个上下文管理器装饰器，
+    # 用于在推理（即使用训练好的模型进行预测）阶段临时禁用梯度计算，以提高推理速度并减少内存消耗。
     @torch.inference_mode()
     def generate(self, idx, eos, max_new_tokens, temperature=0.7, top_k=8, stream=True, rp=1., kv_cache=True):
-        # rp: repetition_penalty
         index = idx.shape[1]
         init_inference = True
         while idx.shape[1] < max_new_tokens - 1:
@@ -253,9 +261,6 @@ class Transformer(PreTrainedModel):
 
             logits = inference_res.logits
             logits = logits[:, -1, :]
-
-            for token in set(idx.tolist()[0]):
-                logits[:, token] /= rp
 
             if temperature == 0.0:
                 _, idx_next = torch.topk(logits, k=1, dim=-1)
@@ -271,10 +276,9 @@ class Transformer(PreTrainedModel):
             if idx_next == eos:
                 break
 
-            idx = torch.cat((idx, idx_next), dim=1)
+            idx = torch.cat((idx, idx_next), dim = 1)
             if stream:
                 yield idx[:, index:]
-
         if not stream:
             yield idx[:, index:]
 
@@ -285,5 +289,11 @@ class Transformer(PreTrainedModel):
         logits = inference_res.logits
         logits = logits[:, -1, :]
         return logits
+
+
+
+
+
+
 
 

@@ -15,7 +15,7 @@ class LMConfig(PretrainedConfig):
                  norm_eps: float = 1e-5,
                  max_seq_len: int = 512,
                  dropout: float = 0.0,
-                 flash_attn: bool = True,
+                 flash_attn: bool = False,
                  use_moe: bool = False,
                  num_experts_per_tok = 2,
                  n_routed_experts = 4,

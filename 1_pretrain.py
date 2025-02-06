@@ -21,16 +21,21 @@ def Logger(content):
     if not ddp or dist.get_rank() == 0:
         print(content)
 
-
+# 定义学习率调度函数，根据当前迭代次数计算学习率，采用余弦退火策略
+# 余弦退火算法的核心思想是根据训练的轮数动态地调整学习率，在训练初期使用较大的学习率，以便快速收敛到最优解附近；
+# 随着训练的进行，逐渐减小学习率，使得模型能够在最优解附近进行更精细的调整，从而提高模型的性能。
 def get_lr(it, all):
-    warmup_iters = args.warmup_iters
-    lr_decay_iters = all
-    min_lr = args.learning_rate / 10
+    warmup_iters = args.warmup_iters  #预热迭代次数
+    lr_decay_iters = all  # 学习率衰减的总迭代次数
+    min_lr = args.learning_rate / 10  # 最小学习率
 
+    # 如果当前迭代次数小于预热迭代次数，使用线性预热策略
     if it < warmup_iters:
         return args.learning_rate * it / warmup_iters
+    # 如果当前迭代次数大于衰减迭代次数，返回最小学习率
     if it > lr_decay_iters:
         return min_lr
+    # 计算衰减系数，使用余弦退火策略
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     assert 0 <= decay_ratio <= 1
     # 余弦退火系数（cosine annealing coefficient）的计算
@@ -47,24 +52,28 @@ def train_epoch(epoch, wandb):
 
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch)
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+            param_group['lr'] = lr # 设置优化器的学习率
 
-        with ctx:
+        with ctx:  # 使用混合精度训练（如果设备是 GPU）
             out = model(X, Y)
-            loss = out.last_loss / args.accumulation_steps
+            loss = out.last_loss / args.accumulation_steps # 计算损失，并进行梯度累积
             loss_mask = loss_mask.view(-1)
             loss = torch.sum(loss * loss_mask) / loss_mask.sum()
 
-        scaler.scale(loss).backward()
+        scaler.scale(loss).backward()  # 反向传播，计算梯度
 
+        # 每 accumulation_steps 步进行一次梯度更新
         if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm(model.parameters(), args.grad_clip)
+            scaler.unscale_(optimizer)  # 反缩放梯度，unscale_ 方法的作用是将之前通过 scaler.scale(loss) 放大的梯度还原到原始大小，这样才能正确地进行梯度裁剪和参数更新。
 
-            scaler.step(optimizer)
-            scaler.update()
+            # 梯度裁剪是一种防止梯度爆炸的技术，通过限制梯度的范数（norm）来确保梯度不会变得过大。
+            # torch.nn.utils.clip_grad_norm 函数会计算模型所有参数的梯度的范数，并将其裁剪到不超过 args.grad_clip 指定的阈值。
+            torch.nn.utils.clip_grad_norm(model.parameters(), args.grad_clip)  # 梯度裁剪
 
-            optimizer.zero_grad(set_to_none=True)
+            scaler.step(optimizer) # 更新模型参数，根据反缩放后的梯度来更新模型的参数
+            scaler.update() # 更新缩放器，根据当前梯度的情况自适应地调整缩放因子
+
+            optimizer.zero_grad(set_to_none=True) # 清空梯度
 
         if step % args.log_interval == 0:
             spend_time = time.time() - start_time
@@ -82,18 +91,19 @@ def train_epoch(epoch, wandb):
                            "lr": optimizer.param_groups[-1]['lr'],
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
 
+        # 每 args.save_interval 步保存一次模型
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
-            model.eval()
+            model.eval() # 切换到评估模式
             moe_path = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/pretrain_{lm_config.dim}{moe_path}.pth'
 
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
+                state_dict = model.module.state_dict() # 获取模型状态字典
             else:
                 state_dict = model.state_dict()
 
             torch.save(state_dict, ckp)
-            model.train()
+            model.train() # 切换回训练模式
 
 
 def init_model():
@@ -124,12 +134,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ziollm Pretraining")
     parser.add_argument("--out_dir", type=str, default="out", help="Output directory")
     parser.add_argument("--epochs", type=int, default=8, help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu",
                         help="Device to use")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="Data type")
-    parser.add_argument("--use_wandb", default=True, help="Use Weights & Biases")
+    parser.add_argument("--use_wandb", default=False, help="Use Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="ziollm-Pretrain", help="Weights & Biases project name")
     parser.add_argument("--num_workers", type=int, default=1, help="Number of workers for data loading")
     parser.add_argument("--data_path", type=str, default="./dataset/pretrain_data.csv", help="Path to training data")
@@ -187,6 +197,7 @@ if __name__ == "__main__":
         sampler=train_sampler
     )
 
+    # 混合精度训练。GradScaler 主要用于在混合精度训练过程中自动进行梯度缩放，以解决半精度浮点数表示范围有限导致的梯度下溢问题。
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
