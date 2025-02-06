@@ -70,7 +70,8 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
-
+# repeat_kv 是一个与多头注意力机制相关的优化技巧，主要用于减少内存使用和计算量
+# 并非为每个头都单独计算和存储键值对，而是让多个头共享相同的键值对，也就是对键值对进行重复使用。
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
@@ -94,6 +95,11 @@ class Attention(nn.Module):
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+
+        ## wo：多头注意力机制中引入的概念，为了整合多头信息并进行线性变换
+        # wo矩阵的主要作用之一就是将所有头的输出拼接起来后进行线性变换，把各个头提取的分散信息融合成一个统一的表示。
+        # 具体来说，多头注意力机制会先将每个头的输出按照最后一个维度进行拼接，形成一个高维的张量，然后通过与矩阵相乘，
+        # 将这个高维张量映射到一个与输入维度相同的空间中，得到最终的多头注意力输出。
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
         self.k_cache, self.v_cache = None, None
@@ -128,6 +134,7 @@ class Attention(nn.Module):
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
+        ## 注意力分数和权重
         scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
         scores = scores + self.mask[:, :, :seqlen, :seqlen]
 
@@ -135,12 +142,17 @@ class Attention(nn.Module):
         scores = self.attn_dropout(scores)
         output = torch.matmul(scores, xv)
 
+        # 拼接多头输出
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-
+        # 对拼接后的多头输出进行线性变换，得到最终的多头注意力输出。
         output = self.wo(output)
+        # 正则化作用
         output = self.resid_dropout(output)
 
         return output
+
+
+
 
 
 class TransformerBlock(nn.Module):
@@ -201,7 +213,9 @@ class Transformer(PreTrainedModel):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * params.n_layers))
 
         self.last_loss = None
-        # 通常用于因果语言模型（如GPT）
+        # 通常用于因果语言模型（如GPT）。因果语言模型的任务是根据前文预测下一个词，
+        # CausalLMOutputWithPast 会封装模型的输出结果，并且包含 past_key_values （键值缓存）信息，
+        # 这对于加速文本生成过程非常重要。
         self.OUT = CausalLMOutputWithPast()
 
         self._no_split_modules = [name for name, _ in self.named_modules()]
@@ -214,6 +228,16 @@ class Transformer(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    """
+    [KV Cache]
+    在基于 Transformer 架构的模型（如 Llama）里，每一层的多头注意力机制会计算键（Key，K）、值（Value，V）和查询（Query，Q）。
+    在文本生成任务中，模型会逐个生成 token，而对于已经处理过的 token，其对应的键和值在后续生成新 token 时不会发生变化。
+    KV Cache 就是利用这一特性，将已经计算好的键和值缓存起来，避免在生成后续 token 时重复计算，从而提高生成效率。
+    [工作流程]
+    初始阶段：在生成第一个 token 时，模型正常计算所有 token（此时只有一个）的键和值，并将其存储在 KV Cache 中。
+    后续生成阶段：当生成后续的 token 时，模型只需要计算当前新 token 的查询向量，然后利用 KV Cache 中已有的键和值进行注意力计算，而不需要重新计算之前token的键和值。
+    这样，随着生成的 token 数量增加，计算量的增长主要集中在新 token 上，而不是所有已生成的 token。
+    """
     def forward(self, tokens: Optional[torch.Tensor] = None, targets: Optional[torch.Tensor] = None,
                 kv_cache=False, **kwargs):
         current_idx = 0
@@ -245,7 +269,6 @@ class Transformer(PreTrainedModel):
         self.OUT.__setitem__('last_loss', self.last_loss)
 
         return self.OUT
-
 
     ## @torch.inference_mode() 是 PyTorch 中的一个上下文管理器装饰器，
     # 用于在推理（即使用训练好的模型进行预测）阶段临时禁用梯度计算，以提高推理速度并减少内存消耗。

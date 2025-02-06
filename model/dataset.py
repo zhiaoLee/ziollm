@@ -27,8 +27,8 @@ class PretrainDataset(Dataset):
         loss_mask = [1] * text_len + [0] * padding_len
 
         input_id = np.array(input_id)
-        X = np.array(input_id[:-1]).astype(np.int64)
-        Y = np.array(input_id[1:]).astype(np.int64)
+        X = np.array(input_id[:-1]).astype(np.int64)  # 输入数据（去掉最后一个 token）
+        Y = np.array(input_id[1:]).astype(np.int64)  # 目标数据（去掉第一个 token）
         loss_mask = np.array(loss_mask[1:]).astype(np.int64)
 
         return torch.from_numpy(X), torch.from_numpy(Y), torch.from_numpy(loss_mask)
